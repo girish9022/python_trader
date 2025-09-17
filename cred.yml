@@ -1,0 +1,7 @@
+# Please fill in your credentials
+user: 'your_user_id'
+pwd: 'your_password'
+factor2: 'your_totp'
+vc: 'your_vendor_code'
+apikey: 'your_api_key'
+imei: 'your_imei'
