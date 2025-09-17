@@ -1371,9 +1371,9 @@ def start_Trade_Terminal():
                             now = dt.now()
                             last_update = last_sma_update.get(i)
 
-                            # Check if it's the first run or if 15 minutes have passed
-                            if last_update is None or (now - last_update).total_seconds() >= 15 * 60:
-                                print(f"Calculating SMAs for {i}...")
+                            # Fetch at the start and then every 60 seconds
+                            if last_update is None or (now - last_update).total_seconds() >= 60:
+                                print(f"fetching sma for {i} on {dt.now().strftime('%Y-%m-%d %H:%M:%S')}")
                                 exchange, token_str = Symbol_Token[i].split('|')
 
                                 sma_df = get_interval_candles_with_sma(api, exchange, token_str)
