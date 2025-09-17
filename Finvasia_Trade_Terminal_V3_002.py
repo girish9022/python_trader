@@ -1,20 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Created on Fri Oct 14 09:13:23 2022
+Created on Fri Aug 31 09:13:23 2025
 
 This tool is to fetch two option chain (of any segment/symbol) data and trade terminal sheet, where all input comes using web socket data which leads to low lag and no api restriction. 
 
-Contact details :
-Telegram Channel:  https://t.me/pythontrader
-Developer Telegram ID : https://t.me/pythontrader_admin
-Gmail ID:   mnkumar2020@gmail.com 
-Whatsapp : 9470669031 
-Youtube : youtube.com/@pythontraders
-
-Disclaimer: The information provided by the Python Traders channel is for educational purposes only, so please contact your financial adviser before placing your trade. Developer is not responsible for any profit/loss happened due to coding, logical or any type of error.
-
-
-Toots Feature :
+Tools Feature :
 1. Trade terminal where you can take paper/real trade.
 2. You can set target/sl together using tool.
 3. You can also trail your sl.
@@ -29,9 +19,37 @@ Market_Safety = 1
 import warnings
 warnings.filterwarnings("ignore")
 
-from NorenRestApiPy.NorenApi import NorenApi
-#from Noren import NorenApi
-import os
+import sys, os ,subprocess, importlib
+
+def ensure(pkgs):
+    for name, pip_name in pkgs:
+        try:
+            importlib.import_module(name)
+            print(f"✅ {name} ok")
+        except ImportError:
+            print(f"⚠️ {name} missing → installing {pip_name}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name])
+
+# -----------------------
+# USAGE
+# -----------------------
+packages = [
+    ("requests", "requests"),
+    ("websocket", "websocket-client"),
+    ("pandas", "pandas"),
+    ("setuptools", "setuptools"),
+    ("pandas_ta", "pandas_ta"),
+    ("pyotp", "pyotp"),
+    ("numpy", "numpy"),
+    ("xlwings", "xlwings"),
+    ("pyttsx3", "pyttsx3"),
+    ("scipy", "scipy"),   # 👈 NEW
+    ("NorenRestApiPy", "./NorenRestApiPy-0.0.22-py2.py3-none-any.whl"),  # local wheel
+]
+
+ensure(packages)
+
+
 import time
 import json
 import sys
@@ -41,55 +59,17 @@ from time import sleep
 import logging
 from threading import Thread
 import numpy as np
+if not hasattr(np, "NaN"):
+    np.NaN = np.nan
 
-try:
-    import pandas as pd
-except (ModuleNotFoundError, ImportError):
-    print("pandas module not found")
-    os.system(f"{sys.executable} -m pip install -U pandas")
-finally:
-    import pandas as pd
-        
-try:
-    import pyotp
-except (ModuleNotFoundError, ImportError):
-    print("pyotp module not found")
-    os.system(f"{sys.executable} -m pip install -U pyotp")
-finally:
-    import pyotp
-    
-try:
-    import xlwings as xw
-except (ModuleNotFoundError, ImportError):
-    print("xlwings module not found")
-    os.system(f"{sys.executable} -m pip install -U xlwings")
-finally:
-    import xlwings as xw
+import pandas as pd
+import pandas_ta as ta
+import pyotp
+import xlwings as xw
+import pyttsx3
+import requests
+from NorenRestApiPy.NorenApi import NorenApi
 
-try:
-    import pyttsx3
-except (ModuleNotFoundError, ImportError):
-    #print("pyttsx3 module not found")
-    os.system(f"{sys.executable} -m pip install -U pyttsx3")
-finally:
-    import pyttsx3
-
-try:
-    import pytz
-except (ModuleNotFoundError, ImportError):
-    print("pytz module not found")
-    os.system(f"{sys.executable} -m pip install -U pytz")
-finally:
-    import pytz
-
-try:
-    import requests
-except (ModuleNotFoundError, ImportError):
-    print("requests module not found")
-    os.system(f"{sys.executable} -m pip install -U requests")
-finally:
-    import requests
-    
 try:
     from GetIVGreeks import DayCountType, ExpType, TryMatchWith, CalcIvGreeks
 except ImportError:
@@ -530,73 +510,32 @@ def subscribe_new_token(exchange, Token):
     symbol.append(f"{exchange}|{Token}")
     api.subscribe(symbol)
 
+def update_sma(symbol, close_price):
+    # Maintain history of closes
+    if symbol not in symbol_history:
+        symbol_history[symbol] = []
+    symbol_history[symbol].append(close_price)
+
+    # Keep only last 200 closes (for SMA100 enough)
+    if len(symbol_history[symbol]) > 200:
+        symbol_history[symbol] = symbol_history[symbol][-200:]
+    
+    # Convert to Series for calculation
+    df = pd.DataFrame(symbol_history[symbol], columns=["close"])
+    
+    # Compute SMAs
+    df["SMA5"]   = ta.sma(df["close"], length=5)
+    df["SMA10"]  = ta.sma(df["close"], length=10)
+    df["SMA20"]  = ta.sma(df["close"], length=20)
+    df["SMA50"]  = ta.sma(df["close"], length=50)
+    df["SMA100"] = ta.sma(df["close"], length=100)
+    
+    # Return latest values (last row)
+    last = df.iloc[-1]
+    return last["SMA5"], last["SMA10"], last["SMA20"], last["SMA50"], last["SMA100"]
+
+
 LimitOrderBook = {}
-
-def get_interval_candles_with_sma(api, exchange, token, days=10, input_interval='1', output_interval=15, sma_windows=(5, 21, 50, 100, 200), tz='Asia/Kolkata'):
-    """
-    Fetches historical data, aggregates it to a specified interval, and calculates SMAs.
-    """
-    try:
-        starttime = (dt.now() - timedelta(days=days)).timestamp()
-        raw_data = api.get_time_price_series(exchange=exchange, token=str(token), starttime=starttime, interval=str(input_interval))
-
-        if not raw_data:
-            print("No raw data received from API.")
-            return None
-
-        df = pd.DataFrame(raw_data)
-
-        if df.empty:
-            print("DataFrame is empty after receiving data.")
-            return None
-
-        # API returns dicts with 'stat': 'Ok' on success and 'stat': 'Not_Ok' on failure
-        if 'stat' in df.columns and (df['stat'] == 'Not_Ok').any():
-            print(f"API returned an error: {df[df['stat'] == 'Not_Ok']['emsg'].iloc[0]}")
-            return None
-
-        df = df.rename(columns={'time': 'datetime', 'into': 'open', 'inth': 'high', 'intl': 'low', 'intc': 'close', 'v': 'volume'})
-
-        df['datetime'] = pd.to_datetime(df['datetime'], format='%d-%m-%Y %H:%M:%S')
-
-        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
-        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-
-        df.dropna(subset=numeric_cols, inplace=True)
-
-        df = df.set_index('datetime')
-
-        try:
-            df.index = df.index.tz_localize('UTC').tz_convert(tz)
-        except TypeError:
-            # This happens if the index is already timezone-aware
-            df.index = df.index.tz_convert(tz)
-
-        agg_rules = {
-            'open': 'first',
-            'high': 'max',
-            'low': 'min',
-            'close': 'last',
-            'volume': 'sum'
-        }
-
-        # Resample to the desired interval
-        agg_df = df.resample(f'{output_interval}T', label='right', closed='right').agg(agg_rules)
-        agg_df.dropna(inplace=True)
-
-        if agg_df.empty:
-            print("Aggregated DataFrame is empty.")
-            return None
-
-        for w in sma_windows:
-            agg_df[f'sma{w}'] = agg_df['close'].rolling(window=w, min_periods=1).mean()
-
-        return agg_df
-
-    except Exception as e:
-        print(f"Exception in get_interval_candles_with_sma: {e}")
-        return None
-
 def start_Trade_Terminal():
     #print("I am inside start_Trade_Terminal")
     global api, live_data
@@ -611,8 +550,10 @@ def start_Trade_Terminal():
     tt.range("q4:s1000").value  = None
     tt.range("u4:w1000").value  = None
     tt.range("aa4:ac1000").value  = None
-    tt.range(f"a3:ac3").value = [ "Symbol", "Open", "High", "Low", "Close", "VWAP", "Best Buy Price",
-                                "Best Sell Price","Volume","OI", "LTP","Percentage change", "Qty", "BUY/SELL", "Entry Signal","Entry Limit Price", "Entry Done @","Entry Order ID", "Entry Remarks","Exit Signal","Exit Done @","Exit Order ID","Exit Remarks", "Target","SL" ,"Trail Enable",    "Latest SL","Trade Status","PnL"]
+    tt.range(f"a3:ac3").value = [ "Symbol", "Open", "High", "Low", "Close", "VWAP", "Best Buy Price","Best Sell Price","Volume","OI", "LTP",
+                                "Percentage change", "Qty", "BUY/SELL", "Entry Signal","Entry Limit Price", "Entry Done @","Entry Order ID", 
+                                "Entry Remarks","Exit Signal","Exit Done @","Exit Order ID","Exit Remarks", "Target","SL" ,"Trail Enable",
+                                "Latest SL","Trade Status","PnL"]
                                 
     tt.range('k1').value =  'PYTHON TRADER'
     tt.range('k1').color = (46,132,198)  
@@ -623,7 +564,6 @@ def start_Trade_Terminal():
     Voice_Message.append(AlertMessage)    
     
     Symbol_Token = {}
-    last_sma_update = {}
     global LimitOrderBook
     #run a parallel thread to update the status
     while True:
@@ -1366,33 +1306,6 @@ def start_Trade_Terminal():
                         except Exception as e:
                             #print(f"exception : {str(e)}")
                             pass
-
-                        try:
-                            now = dt.now()
-                            last_update = last_sma_update.get(i)
-
-                            # Fetch at the start and then every 60 seconds
-                            if last_update is None or (now - last_update).total_seconds() >= 60:
-                                print(f"fetching sma for {i} on {dt.now().strftime('%Y-%m-%d %H:%M:%S')}")
-                                exchange, token_str = Symbol_Token[i].split('|')
-
-                                sma_df = get_interval_candles_with_sma(api, exchange, token_str)
-
-                                if sma_df is not None and not sma_df.empty:
-                                    latest_smas = sma_df.iloc[-1]
-                                    tt.range(f'AD{idx + 4}').value = latest_smas.get('sma5')
-                                    tt.range(f'AE{idx + 4}').value = latest_smas.get('sma21')
-                                    tt.range(f'AF{idx + 4}').value = latest_smas.get('sma50')
-                                    tt.range(f'AG{idx + 4}').value = latest_smas.get('sma100')
-                                    tt.range(f'AH{idx + 4}').value = latest_smas.get('sma200')
-
-                                    # Update the timestamp for the current symbol
-                                    last_sma_update[i] = now
-                                    print(f"SMAs updated for {i}.")
-                                else:
-                                    print(f"Could not calculate SMAs for {i}.")
-                        except Exception as e:
-                            print(f"Error during SMA calculation for {i}: {e}")
                 main_list.append(lst)
 
                 idx += 1
