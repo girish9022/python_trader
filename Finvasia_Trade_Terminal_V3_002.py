@@ -75,6 +75,14 @@ finally:
     import pyttsx3
 
 try:
+    import pytz
+except (ModuleNotFoundError, ImportError):
+    print("pytz module not found")
+    os.system(f"{sys.executable} -m pip install -U pytz")
+finally:
+    import pytz
+
+try:
     import requests
 except (ModuleNotFoundError, ImportError):
     print("requests module not found")
@@ -523,6 +531,72 @@ def subscribe_new_token(exchange, Token):
     api.subscribe(symbol)
 
 LimitOrderBook = {}
+
+def get_interval_candles_with_sma(api, exchange, token, days=10, input_interval='1', output_interval=15, sma_windows=(5, 21, 50, 100, 200), tz='Asia/Kolkata'):
+    """
+    Fetches historical data, aggregates it to a specified interval, and calculates SMAs.
+    """
+    try:
+        starttime = (dt.now() - timedelta(days=days)).timestamp()
+        raw_data = api.get_time_price_series(exchange=exchange, token=str(token), starttime=starttime, interval=str(input_interval))
+
+        if not raw_data:
+            print("No raw data received from API.")
+            return None
+
+        df = pd.DataFrame(raw_data)
+
+        if df.empty:
+            print("DataFrame is empty after receiving data.")
+            return None
+
+        # API returns dicts with 'stat': 'Ok' on success and 'stat': 'Not_Ok' on failure
+        if 'stat' in df.columns and (df['stat'] == 'Not_Ok').any():
+            print(f"API returned an error: {df[df['stat'] == 'Not_Ok']['emsg'].iloc[0]}")
+            return None
+
+        df = df.rename(columns={'time': 'datetime', 'into': 'open', 'inth': 'high', 'intl': 'low', 'intc': 'close', 'v': 'volume'})
+
+        df['datetime'] = pd.to_datetime(df['datetime'], format='%d-%m-%Y %H:%M:%S')
+
+        numeric_cols = ['open', 'high', 'low', 'close', 'volume']
+        df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+
+        df.dropna(subset=numeric_cols, inplace=True)
+
+        df = df.set_index('datetime')
+
+        try:
+            df.index = df.index.tz_localize('UTC').tz_convert(tz)
+        except TypeError:
+            # This happens if the index is already timezone-aware
+            df.index = df.index.tz_convert(tz)
+
+        agg_rules = {
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last',
+            'volume': 'sum'
+        }
+
+        # Resample to the desired interval
+        agg_df = df.resample(f'{output_interval}T', label='right', closed='right').agg(agg_rules)
+        agg_df.dropna(inplace=True)
+
+        if agg_df.empty:
+            print("Aggregated DataFrame is empty.")
+            return None
+
+        for w in sma_windows:
+            agg_df[f'sma{w}'] = agg_df['close'].rolling(window=w, min_periods=1).mean()
+
+        return agg_df
+
+    except Exception as e:
+        print(f"Exception in get_interval_candles_with_sma: {e}")
+        return None
+
 def start_Trade_Terminal():
     #print("I am inside start_Trade_Terminal")
     global api, live_data
@@ -549,6 +623,7 @@ def start_Trade_Terminal():
     Voice_Message.append(AlertMessage)    
     
     Symbol_Token = {}
+    last_sma_update = {}
     global LimitOrderBook
     #run a parallel thread to update the status
     while True:
@@ -1291,6 +1366,33 @@ def start_Trade_Terminal():
                         except Exception as e:
                             #print(f"exception : {str(e)}")
                             pass
+
+                        try:
+                            now = dt.now()
+                            last_update = last_sma_update.get(i)
+
+                            # Check if it's the first run or if 15 minutes have passed
+                            if last_update is None or (now - last_update).total_seconds() >= 15 * 60:
+                                print(f"Calculating SMAs for {i}...")
+                                exchange, token_str = Symbol_Token[i].split('|')
+
+                                sma_df = get_interval_candles_with_sma(api, exchange, token_str)
+
+                                if sma_df is not None and not sma_df.empty:
+                                    latest_smas = sma_df.iloc[-1]
+                                    tt.range(f'AD{idx + 4}').value = latest_smas.get('sma5')
+                                    tt.range(f'AE{idx + 4}').value = latest_smas.get('sma21')
+                                    tt.range(f'AF{idx + 4}').value = latest_smas.get('sma50')
+                                    tt.range(f'AG{idx + 4}').value = latest_smas.get('sma100')
+                                    tt.range(f'AH{idx + 4}').value = latest_smas.get('sma200')
+
+                                    # Update the timestamp for the current symbol
+                                    last_sma_update[i] = now
+                                    print(f"SMAs updated for {i}.")
+                                else:
+                                    print(f"Could not calculate SMAs for {i}.")
+                        except Exception as e:
+                            print(f"Error during SMA calculation for {i}: {e}")
                 main_list.append(lst)
 
                 idx += 1
