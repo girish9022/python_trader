@@ -135,10 +135,6 @@ def write_position(wb, symbol, expiry, search_ltp, lot_size,
 
     opt_row = find_nearest_row(option_chain_output, strike_col, search_ltp)
     if not opt_row:
-        # Instead of:
-        print(f"⚠️ No valid strike found in Option_Chain_Output for {option_type}.")
-        
-        # Use:
         log_event(f"⚠️ No valid strike found in Option_Chain_Output for {option_type}.", level="warning")
         return None
 
@@ -148,9 +144,7 @@ def write_position(wb, symbol, expiry, search_ltp, lot_size,
         return None
 
     strike_price = int(strike_cell_value)
-
     option_symbol = f"NFO:{symbol}{expiry}{'C' if option_type.upper()=='CALL' else 'P'}{strike_price}"
-
     target_row = find_last_row(trade_terminal, "A")
 
     # Write to Excel
@@ -172,9 +166,6 @@ def write_position(wb, symbol, expiry, search_ltp, lot_size,
     }
 
 
-# ==============================
-# --- Fetch Q & K Values ------
-# ==============================
 # ==============================
 # --- Fetch Q & K Values ------
 # ==============================
@@ -227,194 +218,127 @@ def fetch_qk_values(wb, executed_orders, per_order_timeout=5.0):
     return q_total, k_total, order_qk
 
 
-    # --- inside monitor_positions, replace the existing stoploss section with this ---
-    # --- Stoploss adjustment ---
-    # ===========================
-    # Stoploss adjustment block
-    # ===========================
-    if k_total > stoploss_value:
-        adjustment_count += 1
-        log_event(
-            f"⚠️ Adjustment {adjustment_count} Triggered! LTP {k_total} > StopLoss {stoploss_value:.2f}",
-            level="warning"
-        )
-
-        # find the leg with the largest K (losing leg)
-        losing_leg = max(executed_orders, key=lambda o: (o.get("k_value") or 0.0))
-        losing_row = losing_leg["row"]
-
-        current_t_flag = trade_terminal.range(f"T{losing_row}").value
-        if str(current_t_flag).strip().lower() != "true_market":
-            # 1. Close losing leg
-            trade_terminal.range(f"T{losing_row}").value = "True_Market"
-            log_event(
-                f"✍️ Closed losing leg row {losing_row} ({losing_leg['option_symbol']}) at K={losing_leg['k_value']}",
-                level="info"
-            )
-
-            # 2. Place opposite order
-            new_order = search_opposite_and_write(wb, symbol, expiry, losing_leg, lot_size)
-            if new_order:
-                executed_orders.append(new_order)
-                log_event(f"✅ Replacement {new_order['option_type']} placed at row {new_order['row']}", level="info")
-
-                # 3. Refresh totals
-                time.sleep(1)  # give Excel time to update
-                q_total, k_total, order_qk = fetch_qk_values(wb, executed_orders)
-
-                # 4. Update stoploss (dynamic)
-                stoploss_value = q_total * 1.001
-                log_event(
-                    f"📊 After replacement → Entry Total (Q): {q_total} | Live Total (K): {k_total} | "
-                    f"🔁 New StopLoss: {stoploss_value:.2f}",
-                    level="info"
-                )
-            else:
-                log_event("⚠️ Replacement order failed (no strike found).", level="warning")
-
-        # cooldown → prevents multiple triggers on the *same tick*
-        time.sleep(2)
-
-
-# ===========================
-# 2. Extra early-exit condition (1 < K < 5 and before 2 PM)
-# ===========================
-    elif any(1 <= o.get("k_value", 0) <= 5 for o in executed_orders) and now.hour < 14:
-        target_leg = next(o for o in executed_orders if 1 <= o.get("k_value", 0) <= 5)
-
-        log_event(f"⚠️ Early Exit Triggered → {target_leg['option_symbol']} has K={target_leg['k_value']} (<5) before 2PM", level="warning")
-
-        losing_row = target_leg["row"]
-        current_t_flag = trade_terminal.range(f"T{losing_row}").value
-        if str(current_t_flag).strip().lower() != "true_market":
-            trade_terminal.range(f"T{losing_row}").value = "True_Market"
-            log_event(f"✍️ Closed leg row {losing_row} ({target_leg['option_symbol']}) at K={target_leg['k_value']}", level="info")
-
-            # Place new opposite order
-            new_order = search_opposite_and_write(wb, symbol, expiry, target_leg, lot_size)
-            if new_order:
-                executed_orders.append(new_order)
-
-            # Recompute stoploss after replacement
-            q_total, k_total, order_qk = fetch_qk_values(wb, executed_orders)
-            # stoploss_value = q_total * 1.3
-            stoploss_value = q_total * 1.001
-            log_event(f"🔁 New StopLoss value set to {stoploss_value:.2f}", level="info")
-
-        time.sleep(2)
 # ==============================
-# --- Search Opposite & Write --
+# --- Position Monitoring -----
 # ==============================
-def search_opposite_and_write(wb, symbol, expiry, losing_leg, lot_size):
-    losing_type = losing_leg["option_type"]
-    losing_ltp = losing_leg["k_value"]
-
-    opposite_type = "PUT" if losing_type == "CALL" else "CALL"
-    print(f"🔎 Searching {losing_ltp} in {opposite_type} Option Chain...")
-
-    new_order = write_position(
-        wb, symbol, expiry, losing_ltp, lot_size,
-        option_type=opposite_type,
-        buy_or_sell="SELL",
-        entry_signal="True_Market"
-    )
-
-    if new_order:
-        print(f"✅ New {opposite_type} SELL executed at row {new_order['row']}")
-    return new_order
-
-
-# ==============================
-# --- Logging & Monitoring ----
-# ==============================
-
-# Create folder if not exists
-log_dir = "Logs/personal_trade"
-os.makedirs(log_dir, exist_ok=True)
-
-# Generate filename with datetime
-log_filename = datetime.now().strftime("trade_monitor_%Y%m%d_%H%M%S.log")
-log_path = os.path.join(log_dir, log_filename)
-
-logging.basicConfig(
-    filename=log_path,
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-
-
-def log_event(message, level="info"):
-    """Log message to console + file"""
-    print(message)
-    if level == "info":
-        logging.info(message)
-    elif level == "warning":
-        logging.warning(message)
-    elif level == "error":
-        logging.error(message)
-
-
 # --- Set square-off time ---
 SQUARE_OFF_HOUR = 15  # 3 PM
 SQUARE_OFF_MINUTE = 29  # 3:20 PM
+ADJUSTMENT_HOUR_LIMIT = 14 # 2 PM
 
 def monitor_positions(wb, executed_orders, entry_total, symbol, expiry, lot_size):
-    log_event("\n🔄 Starting continuous monitoring...")
+    log_event("\n🔄 Starting continuous monitoring based on new strategy...")
     trade_terminal = wb.sheets["Trade_Terminal"]
-    adjustment_count = 0
+
+    open_positions = list(executed_orders)
+
+    # Fetch initial Q values to establish the first baseline for the 30% rule
+    initial_q_total, _, _ = fetch_qk_values(wb, open_positions)
+    if initial_q_total == 0:
+        log_event("Warning: Initial Q values are zero. Falling back to search prices for initial adjustment baseline.", level="warning")
+        initial_q_total = entry_total
+
+    log_event(f"📈 Initial Combined Premium (Q Total) for adjustments: {initial_q_total:.2f}", level="info")
 
     try:
-        nifty_ltp = trade_terminal.range("K8").value
-        q_total, k_total, order_qk = fetch_qk_values(wb, executed_orders)
-
-        # Initialize stoploss with first q_total
-        # stoploss_value = q_total * 1.3
-        stoploss_value = q_total * 1.001
-
-        log_event(f"📊 Initial Trade → Entry Total (Q): {q_total} | Live Total (K): {k_total:.2f} | "
-                  f"StopLoss: {stoploss_value:.2f} | NIFTY LTP: {nifty_ltp}")
-
         while True:
             now = datetime.now()
+
+            # 1. Check for end-of-day square-off
             if now.hour == SQUARE_OFF_HOUR and now.minute >= SQUARE_OFF_MINUTE:
-                log_event(f"⏰ Auto square-off all positions!", level="warning")
-                for order in executed_orders:
-                    row = order["row"]
-                    trade_terminal.range(f"T{row}").value = "True_Market"
-                    log_event(f"✍️ Marked row {row} ({order['option_symbol']}) as Square_Off")
+                log_event(f"⏰ Auto square-off all open positions at {now.strftime('%H:%M:%S')}!", level="warning")
+                for order in open_positions:
+                    trade_terminal.range(f"T{order['row']}").value = "True_Market"
+                    log_event(f"✍️ Marked row {order['row']} ({order['option_symbol']}) for Square_Off")
+                break # Exit monitoring loop
+
+            if not open_positions:
+                log_event("No open positions to monitor. Exiting.", level="info")
                 break
 
+            # Fetch latest prices for all open positions
+            q_total, k_total, order_qk = fetch_qk_values(wb, open_positions)
+
+            # Log current status
             nifty_ltp = trade_terminal.range("K8").value
+            log_event(f"📊 Status → Positions: {len(open_positions)} | Q Total: {q_total:.2f} | K Total: {k_total:.2f} | "
+                      f"30% Trigger: {initial_q_total * 1.3:.2f} | NIFTY: {nifty_ltp}")
 
-            # --- get latest totals ---
-            q_total, k_total, order_qk = fetch_qk_values(wb, executed_orders)
+            # 2. Check for adjustment triggers (must be before 2 PM)
+            adjustment_triggered = False
+            if now.hour < ADJUSTMENT_HOUR_LIMIT:
+                # Trigger A: Combined premium increased by 30%
+                if k_total >= initial_q_total * 1.30:
+                    log_event(f"🔥 Adjustment Trigger A: Combined premium {k_total:.2f} >= 30% threshold {initial_q_total * 1.30:.2f}", level="warning")
+                    adjustment_triggered = True
 
-            # 🔁 Always recompute stoploss dynamically
-            # stoploss_value = q_total * 1.3
-            stoploss_value = q_total * 1.001
+                # Trigger B: One leg's premium dropped to 5-8 range
+                if not adjustment_triggered:
+                    for order in open_positions:
+                        if 5 <= (order.get("k_value") or 0) <= 8:
+                            log_event(f"🔥 Adjustment Trigger B: Leg {order['option_symbol']} premium is {order['k_value']:.2f} (in 5-8 range)", level="warning")
+                            adjustment_triggered = True
+                            break
 
-            log_event(f"📊 Adjustment {adjustment_count} → Entry Total (Q): {q_total} | Live Total (K): {k_total} | "
-                      f"StopLoss: {stoploss_value:.2f} | NIFTY LTP: {nifty_ltp}")
+            # 3. Perform Adjustment if triggered
+            if adjustment_triggered:
+                if len(open_positions) < 2:
+                    log_event("⚠️ Adjustment triggered, but less than 2 open positions. Cannot perform adjustment.", level="warning")
+                else:
+                    # Identify profitable and unprofitable legs
+                    profitable_leg = min(open_positions, key=lambda o: o.get("k_value") or float('inf'))
+                    unprofitable_leg = max(open_positions, key=lambda o: o.get("k_value") or float('-inf'))
 
-            # ===========================
-            # Stoploss adjustment block
-            # ===========================
-            if k_total > stoploss_value:
-                adjustment_count += 1
-                log_event(f"⚠️ Adjustment {adjustment_count} Triggered! LTP {k_total} > StopLoss {stoploss_value:.2f}", level="warning")
+                    log_event(f"Identified Profitable Leg: {profitable_leg['option_symbol']} @ {profitable_leg['k_value']:.2f}", level="info")
+                    log_event(f"Identified Unprofitable Leg: {unprofitable_leg['option_symbol']} @ {unprofitable_leg['k_value']:.2f}", level="info")
 
-                # (close losing leg + replacement order code here)
-                # ...
+                    new_premium_target = unprofitable_leg.get("k_value")
 
+                    # a. Close the profitable leg
+                    log_event(f"Closing profitable leg: row {profitable_leg['row']}", level="info")
+                    trade_terminal.range(f"T{profitable_leg['row']}").value = "True_Market"
+
+                    # b. Remove from open positions list for monitoring
+                    open_positions = [p for p in open_positions if p['row'] != profitable_leg['row']]
+
+                    # c. Write the new leg
+                    log_event(f"🔎 Searching for new {profitable_leg['option_type']} with premium near {new_premium_target:.2f}", level="info")
+                    new_order = write_position(
+                        wb, symbol, expiry, new_premium_target, lot_size,
+                        option_type=profitable_leg['option_type'],
+                        buy_or_sell="SELL"
+                    )
+
+                    if new_order:
+                        log_event(f"✅ New position written: {new_order['option_symbol']}", level="info")
+                        open_positions.append(new_order)
+
+                        # d. Recalculate the baseline premium for the 30% rule
+                        log_event("Waiting for new position's Q value to update...", level="info")
+                        time.sleep(5) # Give Excel time to update Q value
+                        new_q_total, _, _ = fetch_qk_values(wb, open_positions)
+                        if new_q_total > 0:
+                            initial_q_total = new_q_total
+                            log_event(f"🔁 Baseline premium for 30% rule has been updated to: {initial_q_total:.2f}", level="info")
+                        else:
+                            log_event("⚠️ Could not get new Q values to update baseline. Baseline remains unchanged.", level="warning")
+
+                    else:
+                        log_event(f"⚠️ Could not find a new leg to write. Monitoring will continue with the remaining leg.", level="warning")
+
+                    log_event("Pausing for 5 seconds after adjustment...", level="info")
+                    time.sleep(5)
+                    continue # Restart loop to get fresh data for all positions
+
+            # Main loop sleep
             time.sleep(1)
 
     except Exception as e:
         log_event(f"❌ Critical error in monitoring: {str(e)}", level="error")
+        import traceback
+        log_event(f"Stack trace: {traceback.format_exc()}", level="error")
     finally:
         log_event("🏁 Monitoring completed", level="info")
-
-
 
 
 # ==============================
@@ -454,8 +378,10 @@ if __name__ == "__main__":
         if not executed_orders:
             log_event("❌ No positions executed. Exiting.", level="warning")
         else:
-            entry_total = inputs["search_call_ltp"] + inputs["search_put_ltp"]
-            monitor_positions(wb, executed_orders, entry_total,
+            log_event("Waiting for positions to initialize before monitoring...", level="info")
+            time.sleep(5) # Give Excel time to populate Q values
+            entry_total_fallback = (inputs["search_call_ltp"] or 0) + (inputs["search_put_ltp"] or 0)
+            monitor_positions(wb, executed_orders, entry_total_fallback,
                             inputs["symbol"], inputs["expiry"], inputs["lot_size"])
     except Exception as e:
         log_event(f"❌ CRITICAL ERROR: {str(e)}", level="error")
@@ -463,9 +389,6 @@ if __name__ == "__main__":
         log_event(f"Stack trace: {traceback.format_exc()}", level="error")
     finally:
         log_event("🏁 Program execution completed", level="info")
-
-
-
 
 
 def signal_handler(sig, frame):
